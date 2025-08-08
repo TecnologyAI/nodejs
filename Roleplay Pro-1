@@ -1,0 +1,132 @@
+// server.js
+import express from 'express';
+import http from 'http';
+import { Server } from 'socket.io';
+
+const app = express();
+const server = http.createServer(app);
+const io = new Server(server, {
+  cors: { origin: "*" }
+});
+
+// Simple in-memory world state
+const players = {}; // socketId -> player state
+const adminPassword = process.env.ADMIN_PWD || "admin123"; // ganti di env
+
+// Game config
+const MAP_BOUNDS = { w: 4000, h: 2400 }; // luas pulau (pixel)
+const TICK = 50; // ms
+
+app.use(express.static('public')); // optional: serve client static files from ./public
+
+io.on('connection', socket => {
+  console.log('connect', socket.id);
+
+  // Initial join from client with profile data
+  socket.on('join', (profile) => {
+    players[socket.id] = {
+      id: socket.id,
+      name: profile.name || 'Player',
+      color: profile.color || '#3b82f6',
+      x: Math.floor(Math.random()*MAP_BOUNDS.w),
+      y: Math.floor(Math.random()*MAP_BOUNDS.h),
+      vx:0, vy:0,
+      hunger: 80,
+      money: profile.money || 100,
+      inside: null,
+      vehicle: null,
+      isAdmin: false
+    };
+    socket.emit('joined', { id: socket.id, map: MAP_BOUNDS });
+    // broadcast new player to others
+    socket.broadcast.emit('playerJoined', players[socket.id]);
+  });
+
+  socket.on('input', (data) => {
+    // received movement or action input from client
+    const p = players[socket.id];
+    if(!p) return;
+    // update approximate position from client prediction
+    if(typeof data.x === 'number') p.x = Math.max(0, Math.min(MAP_BOUNDS.w, data.x));
+    if(typeof data.y === 'number') p.y = Math.max(0, Math.min(MAP_BOUNDS.h, data.y));
+    if(typeof data.hunger === 'number') p.hunger = data.hunger;
+    // keep vx/vy if present
+    if(typeof data.vx === 'number') p.vx = data.vx;
+    if(typeof data.vy === 'number') p.vy = data.vy;
+  });
+
+  socket.on('action', (act) => {
+    // actions: buyFood, sleep, enterVehicle, work, etc
+    const p = players[socket.id];
+    if(!p) return;
+    if(act.type === 'buyFood'){
+      if(p.money >= 10){
+        p.money -= 10;
+        p.hunger = Math.min(100, p.hunger + 30);
+        socket.emit('actionResult', { ok:true, msg:'Beli makanan berhasil' });
+      } else socket.emit('actionResult', { ok:false, msg:'Uang tidak cukup' });
+    } else if(act.type === 'work'){
+      p.money += 20;
+      p.hunger = Math.max(0, p.hunger - 8);
+      socket.emit('actionResult', { ok:true, msg:'Kerja +Rp20' });
+    } else if(act.type === 'sleep'){
+      p.hunger = Math.min(100, p.hunger + 50);
+      socket.emit('actionResult', { ok:true, msg:'Tidur pulas' });
+    }
+  });
+
+  socket.on('admin:login', (pwd) => {
+    if(pwd === adminPassword){
+      if(players[socket.id]) players[socket.id].isAdmin = true;
+      socket.emit('admin:ok');
+      console.log('admin logged', socket.id);
+    } else {
+      socket.emit('admin:fail');
+    }
+  });
+
+  socket.on('admin:cmd', (cmd) => {
+    // cmd: { action:'setMoney', targetId, value }
+    const p = players[socket.id];
+    if(!p || !p.isAdmin) return;
+    if(cmd.action === 'setMoney'){
+      if(players[cmd.targetId]) {
+        players[cmd.targetId].money = Number(cmd.value) || 0;
+        io.to(cmd.targetId).emit('moneyUpdate', players[cmd.targetId].money);
+      }
+    } else if(cmd.action === 'spawnVehicle'){
+      // broadcast spawn vehicle event
+      io.emit('spawnVehicle', { id: 'v_' + Date.now(), kind: cmd.kind, x: cmd.x||100, y: cmd.y||100 });
+    } else if(cmd.action === 'teleport'){
+      if(players[cmd.targetId]) {
+        players[cmd.targetId].x = cmd.x; players[cmd.targetId].y = cmd.y;
+        io.to(cmd.targetId).emit('teleport', { x: cmd.x, y: cmd.y });
+      }
+    }
+  });
+
+  socket.on('disconnect', () => {
+    console.log('disconnect', socket.id);
+    delete players[socket.id];
+    socket.broadcast.emit('playerLeft', socket.id);
+  });
+});
+
+// Tick: broadcast all players position every TICK ms
+setInterval(() => {
+  io.emit('state', Object.values(players));
+  // hunger drain & auto RS teleport if hunger==0
+  Object.values(players).forEach(p => {
+    p.hunger = Math.max(0, p.hunger - 0.02);
+    if(p.hunger <= 0){
+      // send to hospital spawn
+      p.x = 200; p.y = 200; // example hospital coords
+      p.hunger = 30; // regain a bit on respawn
+      p.money = Math.max(0, p.money - 20);
+      io.to(p.id).emit('sentToHospital', { x:p.x, y:p.y });
+    }
+  });
+}, TICK);
+
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, ()=> console.log('Server listening', PORT));
